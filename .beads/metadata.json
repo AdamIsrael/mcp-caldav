@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "mcp_caldav",
+  "project_id": "6c8f6485-aa32-41cc-bb88-e6ee7cd9157b"
+}
