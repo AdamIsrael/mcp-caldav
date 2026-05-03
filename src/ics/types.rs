@@ -19,6 +19,10 @@ pub struct EventSummary {
     pub description: Option<String>,
     pub is_recurring: bool,
     pub url: String,
+    /// Resolved IANA timezone for DTSTART. None for UTC, floating, or all-day values.
+    /// Required for correct RRULE expansion across DST transitions.
+    #[serde(skip)]
+    pub dtstart_tz: Option<chrono_tz::Tz>,
 }
 
 impl EventSummary {
@@ -146,6 +150,7 @@ mod tests {
             description: description.map(String::from),
             is_recurring: false,
             url: String::new(),
+            dtstart_tz: None,
         }
     }
 
@@ -203,6 +208,7 @@ mod tests {
             description: None,
             is_recurring: false,
             url: String::new(),
+            dtstart_tz: None,
         };
         assert!(!e.matches_query("dragonfruit"));
     }

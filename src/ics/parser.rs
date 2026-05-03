@@ -4,8 +4,16 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::error::CalDavError;
-use crate::ics::timezone::{extract_timezones, format_datetime, parse_datetime};
+use crate::ics::timezone::{extract_timezones, format_datetime, parse_datetime, resolve_timezone};
 use crate::ics::types::{EventDetail, EventSummary};
+
+fn resolve_dtstart_tz(
+    tzid: Option<&str>,
+    tz_map: &HashMap<String, chrono_tz::Tz>,
+) -> Option<chrono_tz::Tz> {
+    let tzid = tzid?;
+    tz_map.get(tzid).copied().or_else(|| resolve_timezone(tzid))
+}
 
 /// Parse ICS data and extract event summaries.
 /// Layer 1: icalendar crate. Layer 2: regex fallback.
@@ -55,6 +63,12 @@ fn parse_events_icalendar(ics: &str, event_url: &str) -> Result<Vec<EventSummary
         let dtstart = extract_datetime_from_properties(event.properties(), "DTSTART", &tz_map)?;
         let dtend = extract_datetime_from_properties(event.properties(), "DTEND", &tz_map).ok();
 
+        let dtstart_tzid = event
+            .properties()
+            .get("DTSTART")
+            .and_then(|p| p.params().get("TZID").map(|t| t.value().to_string()));
+        let dtstart_tz = resolve_dtstart_tz(dtstart_tzid.as_deref(), &tz_map);
+
         let is_recurring = event.property_value("RRULE").is_some();
 
         events.push(EventSummary {
@@ -66,6 +80,7 @@ fn parse_events_icalendar(ics: &str, event_url: &str) -> Result<Vec<EventSummary
             description: event.property_value("DESCRIPTION").map(String::from),
             is_recurring,
             url: event_url.to_string(),
+            dtstart_tz,
         });
     }
 
@@ -80,7 +95,6 @@ fn parse_details_icalendar(ics: &str, event_url: &str) -> Result<Vec<EventDetail
         .map_err(|e| CalDavError::IcsParseError(format!("icalendar parse error: {e}")))?;
 
     let tz_map = extract_timezones(ics);
-    let display_tz = tz_map.values().next().copied();
     let mut details = Vec::new();
 
     for component in &calendar.components {
@@ -99,6 +113,12 @@ fn parse_details_icalendar(ics: &str, event_url: &str) -> Result<Vec<EventDetail
 
         let dtstart = extract_datetime_from_properties(event.properties(), "DTSTART", &tz_map)?;
         let dtend = extract_datetime_from_properties(event.properties(), "DTEND", &tz_map).ok();
+
+        let dtstart_tzid = event
+            .properties()
+            .get("DTSTART")
+            .and_then(|p| p.params().get("TZID").map(|t| t.value().to_string()));
+        let display_tz = resolve_dtstart_tz(dtstart_tzid.as_deref(), &tz_map);
 
         let (_, local_start) = format_datetime(dtstart, display_tz);
         let local_end = dtend.map(|e| format_datetime(e, display_tz).1);
@@ -176,6 +196,7 @@ fn parse_events_fallback(ics: &str, event_url: &str) -> Result<Vec<EventSummary>
 
         let tzid = extract_tzid_param(block, "DTSTART");
         let dtstart = parse_datetime(dtstart_raw, tzid.as_deref(), &tz_map)?;
+        let dtstart_tz = resolve_dtstart_tz(tzid.as_deref(), &tz_map);
 
         let dtend = props.get("DTEND").and_then(|v| {
             let tzid = extract_tzid_param(block, "DTEND");
@@ -193,6 +214,7 @@ fn parse_events_fallback(ics: &str, event_url: &str) -> Result<Vec<EventSummary>
             description: props.get("DESCRIPTION").cloned(),
             is_recurring,
             url: event_url.to_string(),
+            dtstart_tz,
         });
     }
 
@@ -205,7 +227,6 @@ fn parse_events_fallback(ics: &str, event_url: &str) -> Result<Vec<EventSummary>
 
 fn parse_details_fallback(ics: &str, event_url: &str) -> Result<Vec<EventDetail>, CalDavError> {
     let tz_map = extract_timezones(ics);
-    let display_tz = tz_map.values().next().copied();
     let mut details = Vec::new();
 
     for vevent in RE_VEVENT.captures_iter(ics) {
@@ -224,6 +245,7 @@ fn parse_details_fallback(ics: &str, event_url: &str) -> Result<Vec<EventDetail>
 
         let tzid = extract_tzid_param(block, "DTSTART");
         let dtstart = parse_datetime(dtstart_raw, tzid.as_deref(), &tz_map)?;
+        let display_tz = resolve_dtstart_tz(tzid.as_deref(), &tz_map);
         let dtend = props.get("DTEND").and_then(|v| {
             let tzid = extract_tzid_param(block, "DTEND");
             parse_datetime(v, tzid.as_deref(), &tz_map).ok()
@@ -308,6 +330,81 @@ END:VCALENDAR\r\n";
         // Whole point of fixing 9gu: search by a description-only word resolves.
         assert!(e.matches_query("dragonfruit"));
         assert!(e.matches_query("aurelius"));
+    }
+
+    #[test]
+    fn icalendar_path_resolves_dtstart_tz_from_tzid() {
+        // Event with explicit TZID — parser must surface the resolved zone so
+        // downstream RRULE expansion can iterate in local time across DST.
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc-123\r\n\
+SUMMARY:NY Sync\r\n\
+DTSTART;TZID=America/New_York:20260105T090000\r\n\
+DTEND;TZID=America/New_York:20260105T100000\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let events = parse_events(ics, "https://example/cal/abc.ics").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].dtstart_tz.map(|tz| tz.name().to_string()),
+            Some("America/New_York".to_string())
+        );
+    }
+
+    #[test]
+    fn icalendar_path_leaves_dtstart_tz_none_for_utc_events() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc-123\r\n\
+SUMMARY:UTC event\r\n\
+DTSTART:20260105T140000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let events = parse_events(ics, "https://example/cal/abc.ics").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].dtstart_tz.is_none());
+    }
+
+    #[test]
+    fn event_detail_local_time_uses_dtstart_tzid_when_multiple_vtimezones_present() {
+        // Two VTIMEZONE blocks; the event's DTSTART references New York. The
+        // displayed local time must always render in New York, not Berlin —
+        // i.e., independent of HashMap iteration order across runs. This pins
+        // the fix for ypp.
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:America/New_York\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Europe/Berlin\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc-123\r\n\
+SUMMARY:NY meeting\r\n\
+DTSTART;TZID=America/New_York:20260105T090000\r\n\
+DTEND;TZID=America/New_York:20260105T100000\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        // Run the parse repeatedly: HashMap iteration order is randomized
+        // per-process, but the same process keeps the same seed, so a single
+        // run isn't enough to demonstrate determinism. Instead we assert the
+        // structural invariant: the rendered timezone is NY, never Berlin.
+        let details = parse_event_details(ics, "https://example/x.ics").unwrap();
+        assert_eq!(details.len(), 1);
+        let local = &details[0].local_start;
+        assert!(
+            local.contains("America/New_York") || local.contains("EST") || local.contains("EDT"),
+            "expected NY in local_start, got {local:?}"
+        );
+        assert!(
+            !local.contains("Europe/Berlin") && !local.contains("Berlin"),
+            "expected NOT to render in Berlin, got {local:?}"
+        );
     }
 
     #[test]

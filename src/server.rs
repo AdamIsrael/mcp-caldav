@@ -15,7 +15,6 @@ use crate::dav::xml;
 use crate::error::CalDavError;
 use crate::ics::parser;
 use crate::ics::rrule::expand_rrule;
-use crate::ics::timezone::extract_timezones;
 use crate::ics::types::EventSummary;
 
 #[derive(Clone)]
@@ -195,12 +194,14 @@ impl CalDavServer {
                             .dtend
                             .map(|e| e - event.dtstart)
                             .unwrap_or(Duration::hours(1));
-                        let tz_map = extract_timezones(ics);
-                        let display_tz = tz_map.values().next().copied();
+                        // Use the event's own DTSTART timezone for both expansion
+                        // and display; falls back to None for UTC/floating/all-day.
+                        let display_tz = event.dtstart_tz;
 
                         match expand_rrule(
                             &rrule_str,
                             event.dtstart,
+                            event.dtstart_tz,
                             duration,
                             range_start,
                             range_end,
