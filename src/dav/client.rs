@@ -112,11 +112,11 @@ fn resolve_href(base: &str, href: &str) -> String {
         return href.to_string();
     }
     // Extract scheme + host from base
-    if let Some(pos) = base.find("://") {
-        if let Some(slash) = base[pos + 3..].find('/') {
-            let origin = &base[..pos + 3 + slash];
-            return format!("{origin}{href}");
-        }
+    if let Some(pos) = base.find("://")
+        && let Some(slash) = base[pos + 3..].find('/')
+    {
+        let origin = &base[..pos + 3 + slash];
+        return format!("{origin}{href}");
     }
     // Fallback: just concatenate
     format!("{base}{href}")

@@ -29,6 +29,7 @@ pub struct Credentials {
     pub user: Option<String>,
     pub pass: Option<String>,
     pub token: Option<String>,
+    #[allow(dead_code)] // reserved for OAuth2 refresh flow
     pub refresh_token: Option<String>,
 }
 

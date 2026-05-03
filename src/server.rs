@@ -244,7 +244,7 @@ impl CalDavServer {
         }
     }
 
-    #[tool(description = "Search for events by text query. Tries server-side search first, falls back to client-side filtering.")]
+    #[tool(description = "Search for events by text query. Matches case-insensitively against SUMMARY, DESCRIPTION, and LOCATION.")]
     async fn search_events(
         &self,
         Parameters(args): Parameters<SearchEventsArgs>,
@@ -265,25 +265,13 @@ impl CalDavServer {
             .transpose()?
             .unwrap_or(today + chrono::Duration::days(30));
 
-        let start_ts = to_caldav_timestamp(start);
-        let end_ts = to_caldav_timestamp(end);
+        // Server-side text-match prop-filters only check SUMMARY across the
+        // CalDAV servers we target, so they silently drop hits in DESCRIPTION
+        // or LOCATION. Fetch the full date window and filter client-side.
+        let body = xml::calendar_query_body(&to_caldav_timestamp(start), &to_caldav_timestamp(end));
+        let resources = client.report(&args.calendar_url, &body).await?;
 
-        // Try server-side search first
-        let body = xml::text_search_body(&args.query, &start_ts, &end_ts);
-        let server_results = client.report(&args.calendar_url, &body).await;
-
-        let resources = match server_results {
-            Ok(r) if !r.is_empty() => r,
-            _ => {
-                tracing::info!("server-side search failed or empty, falling back to client-side");
-                let body = xml::calendar_query_body(&start_ts, &end_ts);
-                client.report(&args.calendar_url, &body).await?
-            }
-        };
-
-        let query_lower = args.query.to_lowercase();
         let mut matches: Vec<EventSummary> = Vec::new();
-
         for resource in &resources {
             let Some(ics) = &resource.calendar_data else {
                 continue;
@@ -295,9 +283,7 @@ impl CalDavServer {
             };
 
             for event in events {
-                if event.summary.to_lowercase().contains(&query_lower)
-                    || ics.to_lowercase().contains(&query_lower)
-                {
+                if event.matches_query(&args.query) {
                     matches.push(event);
                 }
             }

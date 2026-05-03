@@ -63,6 +63,7 @@ fn parse_events_icalendar(ics: &str, event_url: &str) -> Result<Vec<EventSummary
             dtstart,
             dtend,
             location: event.property_value("LOCATION").map(String::from),
+            description: event.property_value("DESCRIPTION").map(String::from),
             is_recurring,
             url: event_url.to_string(),
         });
@@ -189,6 +190,7 @@ fn parse_events_fallback(ics: &str, event_url: &str) -> Result<Vec<EventSummary>
             dtstart,
             dtend,
             location: props.get("LOCATION").cloned(),
+            description: props.get("DESCRIPTION").cloned(),
             is_recurring,
             url: event_url.to_string(),
         });
@@ -274,4 +276,58 @@ fn extract_tzid_param(block: &str, prop_name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ICS_FULL_FIELDS: &str = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc-123\r\n\
+SUMMARY:Weekly Sync\r\n\
+DESCRIPTION:Discuss roadmap and dragonfruit plans\r\n\
+LOCATION:Cafe Aurelius\r\n\
+DTSTART:20260503T140000Z\r\n\
+DTEND:20260503T150000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    #[test]
+    fn icalendar_path_captures_description_and_location() {
+        let events = parse_events(ICS_FULL_FIELDS, "https://example/cal/abc.ics").unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.summary, "Weekly Sync");
+        assert_eq!(e.location.as_deref(), Some("Cafe Aurelius"));
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Discuss roadmap and dragonfruit plans")
+        );
+        // Whole point of fixing 9gu: search by a description-only word resolves.
+        assert!(e.matches_query("dragonfruit"));
+        assert!(e.matches_query("aurelius"));
+    }
+
+    #[test]
+    fn fallback_path_captures_description_and_location() {
+        // Force the regex fallback by feeding a malformed-but-recoverable ICS
+        // (missing BEGIN:VCALENDAR/VERSION/END:VCALENDAR — icalendar parser will fail).
+        let malformed = "BEGIN:VEVENT\r\n\
+UID:abc-123\r\n\
+SUMMARY:Weekly Sync\r\n\
+DESCRIPTION:Discuss roadmap and dragonfruit plans\r\n\
+LOCATION:Cafe Aurelius\r\n\
+DTSTART:20260503T140000Z\r\n\
+END:VEVENT\r\n";
+        let events = parse_events(malformed, "https://example/cal/abc.ics").unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.location.as_deref(), Some("Cafe Aurelius"));
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Discuss roadmap and dragonfruit plans")
+        );
+    }
 }

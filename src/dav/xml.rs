@@ -32,12 +32,14 @@ pub struct Prop {
     #[serde(rename = "calendar-color")]
     pub calendar_color: Option<String>,
     pub resourcetype: Option<ResourceType>,
+    #[allow(dead_code)] // parsed for future content-type checks
     pub getcontenttype: Option<String>,
     pub getetag: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ResourceType {
+    #[allow(dead_code)] // parsed but not currently inspected; calendar field is what we use
     pub collection: Option<Empty>,
     pub calendar: Option<Empty>,
 }
@@ -53,6 +55,7 @@ pub struct DavResource {
     pub calendar_data: Option<String>,
     pub calendar_color: Option<String>,
     pub is_calendar: bool,
+    #[allow(dead_code)] // captured for future conditional-GET / If-Match support
     pub etag: Option<String>,
 }
 
@@ -137,35 +140,7 @@ pub fn calendar_query_body(start: &str, end: &str) -> String {
     )
 }
 
-pub fn text_search_body(query: &str, start: &str, end: &str) -> String {
-    // Escape XML special chars in query
-    let query = query
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;");
-
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop>
-    <d:getetag/>
-    <c:calendar-data/>
-  </d:prop>
-  <c:filter>
-    <c:comp-filter name="VCALENDAR">
-      <c:comp-filter name="VEVENT">
-        <c:time-range start="{start}" end="{end}"/>
-        <c:prop-filter name="SUMMARY">
-          <c:text-match collation="i;unicode-casemap" match-type="contains">{query}</c:text-match>
-        </c:prop-filter>
-      </c:comp-filter>
-    </c:comp-filter>
-  </c:filter>
-</c:calendar-query>"#
-    )
-}
-
+#[allow(dead_code)] // helper retained for callers that need calendar-multiget instead of inlined calendar-data
 pub fn multiget_body(urls: &[&str]) -> String {
     let hrefs: String = urls
         .iter()
