@@ -36,10 +36,13 @@ pub struct ListCalendarsArgs {
 pub struct ListEventsArgs {
     /// CalDAV URL of the calendar
     pub calendar_url: String,
-    /// Start date (YYYY-MM-DD)
+    /// Start date (YYYY-MM-DD), interpreted in `timezone`
     pub start_date: String,
-    /// End date (YYYY-MM-DD)
+    /// End date (YYYY-MM-DD), inclusive, interpreted in `timezone`
     pub end_date: String,
+    /// IANA timezone name (e.g. "America/Toronto") used to anchor start_date
+    /// and end_date as local-day boundaries. Defaults to the system local zone.
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -52,6 +55,8 @@ pub struct SearchEventsArgs {
     pub start_date: Option<String>,
     /// End date (YYYY-MM-DD, optional — defaults to +30 days)
     pub end_date: Option<String>,
+    /// IANA timezone name (e.g. "America/Toronto"). Defaults to system local.
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -64,14 +69,17 @@ pub struct GetEventDetailsArgs {
     pub calendar_url: Option<String>,
 }
 
+#[cfg(feature = "diagnostics")]
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DumpRawCalendarDataArgs {
     /// CalDAV URL of the calendar
     pub calendar_url: String,
-    /// Start date (YYYY-MM-DD)
+    /// Start date (YYYY-MM-DD), interpreted in `timezone`
     pub start_date: String,
-    /// End date (YYYY-MM-DD)
+    /// End date (YYYY-MM-DD), inclusive, interpreted in `timezone`
     pub end_date: String,
+    /// IANA timezone name (e.g. "America/Toronto"). Defaults to system local.
+    pub timezone: Option<String>,
 }
 
 // --- Server implementation ---
@@ -83,8 +91,11 @@ impl CalDavServer {
             let client = WebDavClient::new(account.clone());
             clients.insert(account.name.clone(), client);
         }
+        let tool_router = Self::tool_router();
+        #[cfg(feature = "diagnostics")]
+        let tool_router = tool_router + Self::diagnostics_router();
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             clients,
             cache: CalendarCache::new(),
         }
@@ -120,8 +131,57 @@ fn parse_date(s: &str) -> Result<NaiveDate, CalDavError> {
         .map_err(|e| CalDavError::Config(format!("invalid date '{s}': {e}")))
 }
 
-fn to_caldav_timestamp(date: NaiveDate) -> String {
-    format!("{}T000000Z", date.format("%Y%m%d"))
+fn parse_timezone_arg(arg: Option<&str>) -> Result<Option<chrono_tz::Tz>, CalDavError> {
+    arg.map(|s| {
+        s.parse::<chrono_tz::Tz>()
+            .map_err(|e| CalDavError::Config(format!("invalid timezone '{s}': {e}")))
+    })
+    .transpose()
+}
+
+/// Convert an inclusive local-day range into a half-open UTC window.
+///
+/// `start` becomes 00:00:00 of `start` in `tz` (or system local if None);
+/// `end` (inclusive) becomes 00:00:00 of `end + 1 day`, also local — i.e., the
+/// exclusive upper bound. Both are then converted to UTC. This is what CalDAV's
+/// `<time-range start=... end=.../>` element wants per RFC 4791 §9.9.
+fn local_day_window_to_utc(
+    start: NaiveDate,
+    end_inclusive: NaiveDate,
+    tz: Option<chrono_tz::Tz>,
+) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), CalDavError> {
+    let start_local = start.and_hms_opt(0, 0, 0).unwrap();
+    let end_exclusive_local = (end_inclusive + chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    Ok((
+        resolve_local_to_utc(start_local, tz)?,
+        resolve_local_to_utc(end_exclusive_local, tz)?,
+    ))
+}
+
+fn resolve_local_to_utc(
+    naive: chrono::NaiveDateTime,
+    tz: Option<chrono_tz::Tz>,
+) -> Result<chrono::DateTime<Utc>, CalDavError> {
+    use chrono::TimeZone;
+    let resolved = match tz {
+        Some(tz) => tz
+            .from_local_datetime(&naive)
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc)),
+        None => chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .map(|dt| dt.with_timezone(&Utc)),
+    };
+    resolved.ok_or_else(|| {
+        CalDavError::Config(format!("ambiguous or non-existent local time: {naive}"))
+    })
+}
+
+fn to_caldav_timestamp(dt: chrono::DateTime<Utc>) -> String {
+    dt.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
 #[rmcp::tool_router]
@@ -174,18 +234,24 @@ impl CalDavServer {
         let client = self.find_client_for_url(&args.calendar_url)?;
         let start = parse_date(&args.start_date)?;
         let end = parse_date(&args.end_date)?;
+        let tz = parse_timezone_arg(args.timezone.as_deref())?;
 
-        let body = xml::calendar_query_body(&to_caldav_timestamp(start), &to_caldav_timestamp(end));
+        let (range_start, range_end) = local_day_window_to_utc(start, end, tz)?;
+
+        let body = xml::calendar_query_body(
+            &to_caldav_timestamp(range_start),
+            &to_caldav_timestamp(range_end),
+        );
         let resources = client.report(&args.calendar_url, &body).await?;
         tracing::debug!(
-            "list_events: range={}..{} resources={}",
+            "list_events: range={}..{} (tz={:?}) -> UTC [{}, {}); resources={}",
             args.start_date,
             args.end_date,
+            args.timezone.as_deref().unwrap_or("local"),
+            range_start,
+            range_end,
             resources.len()
         );
-
-        let range_start = start.and_hms_opt(0, 0, 0).unwrap().and_utc();
-        let range_end = end.and_hms_opt(23, 59, 59).unwrap().and_utc();
 
         let mut all_events: Vec<EventSummary> = Vec::new();
         let mut instances_output: Vec<String> = Vec::new();
@@ -307,11 +373,16 @@ impl CalDavServer {
             .map(parse_date)
             .transpose()?
             .unwrap_or(today + chrono::Duration::days(30));
+        let tz = parse_timezone_arg(args.timezone.as_deref())?;
+        let (range_start, range_end) = local_day_window_to_utc(start, end, tz)?;
 
         // Server-side text-match prop-filters only check SUMMARY across the
         // CalDAV servers we target, so they silently drop hits in DESCRIPTION
         // or LOCATION. Fetch the full date window and filter client-side.
-        let body = xml::calendar_query_body(&to_caldav_timestamp(start), &to_caldav_timestamp(end));
+        let body = xml::calendar_query_body(
+            &to_caldav_timestamp(range_start),
+            &to_caldav_timestamp(range_end),
+        );
         let resources = client.report(&args.calendar_url, &body).await?;
 
         let mut matches: Vec<EventSummary> = Vec::new();
@@ -388,7 +459,11 @@ impl CalDavServer {
             Ok(output.join("\n---\n"))
         }
     }
+}
 
+#[cfg(feature = "diagnostics")]
+#[rmcp::tool_router(router = diagnostics_router)]
+impl CalDavServer {
     #[tool(description = "DIAGNOSTIC: fetch and return the unparsed ICS bodies in a date range. Use when list_events seems to be missing events to inspect what the server actually returned.")]
     async fn dump_raw_calendar_data(
         &self,
@@ -397,8 +472,13 @@ impl CalDavServer {
         let client = self.find_client_for_url(&args.calendar_url)?;
         let start = parse_date(&args.start_date)?;
         let end = parse_date(&args.end_date)?;
+        let tz = parse_timezone_arg(args.timezone.as_deref())?;
+        let (range_start, range_end) = local_day_window_to_utc(start, end, tz)?;
 
-        let body = xml::calendar_query_body(&to_caldav_timestamp(start), &to_caldav_timestamp(end));
+        let body = xml::calendar_query_body(
+            &to_caldav_timestamp(range_start),
+            &to_caldav_timestamp(range_end),
+        );
         let resources = client.report(&args.calendar_url, &body).await?;
 
         let mut out = String::new();
@@ -520,6 +600,106 @@ impl rmcp::ServerHandler for CalDavServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn date(s: &str) -> NaiveDate {
+        parse_date(s).unwrap()
+    }
+
+    #[test]
+    fn day_window_spans_one_local_day_in_toronto() {
+        // Pinning the exact symptom: a single-day query for 2026-05-03 in
+        // America/Toronto must produce a UTC window that includes 22:00
+        // Toronto (= 2026-05-04 02:00 UTC, since EDT is UTC-4 in May).
+        let toronto: chrono_tz::Tz = "America/Toronto".parse().unwrap();
+        let (start, end) = local_day_window_to_utc(
+            date("2026-05-03"),
+            date("2026-05-03"),
+            Some(toronto),
+        )
+        .unwrap();
+
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 5, 3, 4, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 5, 4, 4, 0, 0).unwrap());
+        // 22:00 EDT on 2026-05-03 = 02:00 UTC on 2026-05-04 — must be inside.
+        let evening = Utc.with_ymd_and_hms(2026, 5, 4, 2, 0, 0).unwrap();
+        assert!(evening >= start && evening < end);
+    }
+
+    #[test]
+    fn day_window_for_tokyo_evening_event_includes_the_event() {
+        // East-of-UTC: Tokyo is UTC+9. A 22:00 Tokyo event on 2026-05-03 is
+        // 13:00 UTC the SAME day. With UTC-anchored ranges that worked, but
+        // a 06:00 Tokyo event on 2026-05-03 is 21:00 UTC the PREVIOUS day —
+        // and a UTC-anchored window misses it. Local-anchored window must
+        // include both.
+        let tokyo: chrono_tz::Tz = "Asia/Tokyo".parse().unwrap();
+        let (start, end) = local_day_window_to_utc(
+            date("2026-05-03"),
+            date("2026-05-03"),
+            Some(tokyo),
+        )
+        .unwrap();
+
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 5, 2, 15, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 5, 3, 15, 0, 0).unwrap());
+
+        let early_tokyo = Utc.with_ymd_and_hms(2026, 5, 2, 21, 0, 0).unwrap(); // 06:00 Tokyo
+        let late_tokyo = Utc.with_ymd_and_hms(2026, 5, 3, 13, 0, 0).unwrap(); // 22:00 Tokyo
+        assert!(early_tokyo >= start && early_tokyo < end);
+        assert!(late_tokyo >= start && late_tokyo < end);
+    }
+
+    #[test]
+    fn day_window_inclusive_end_covers_last_day_in_full() {
+        // Multi-day query 2026-05-01..2026-05-03 in Toronto must include all of
+        // 2026-05-03 local — exclusive UTC end is 2026-05-04 04:00 UTC.
+        let toronto: chrono_tz::Tz = "America/Toronto".parse().unwrap();
+        let (start, end) = local_day_window_to_utc(
+            date("2026-05-01"),
+            date("2026-05-03"),
+            Some(toronto),
+        )
+        .unwrap();
+
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 5, 1, 4, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 5, 4, 4, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn day_window_handles_dst_spring_forward() {
+        // 2026-03-08 is the day Toronto springs forward (02:00 → 03:00 EDT).
+        // Day boundaries (00:00 and 24:00) still exist, so the window resolves.
+        let toronto: chrono_tz::Tz = "America/Toronto".parse().unwrap();
+        let (start, end) = local_day_window_to_utc(
+            date("2026-03-08"),
+            date("2026-03-08"),
+            Some(toronto),
+        )
+        .unwrap();
+
+        // 00:00 EST = 05:00 UTC; 00:00 EDT next day = 04:00 UTC.
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 3, 8, 5, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 3, 9, 4, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn day_window_rejects_invalid_timezone() {
+        let err = parse_timezone_arg(Some("Not/A/Real_Zone")).unwrap_err();
+        match err {
+            CalDavError::Config(msg) => {
+                assert!(msg.contains("Not/A/Real_Zone"), "got: {msg}");
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caldav_timestamp_format_is_basic_utc() {
+        // CalDAV expects compact basic format with trailing Z.
+        let dt = Utc.with_ymd_and_hms(2026, 5, 3, 4, 0, 0).unwrap();
+        assert_eq!(to_caldav_timestamp(dt), "20260503T040000Z");
+    }
 
     #[test]
     fn extract_modifiers_from_master_only_returns_exdate_and_rdate() {
