@@ -60,7 +60,16 @@ fn parse_events_icalendar(ics: &str, event_url: &str) -> Result<Vec<EventSummary
             .unwrap_or("(no title)")
             .to_string();
 
-        let dtstart = extract_datetime_from_properties(event.properties(), "DTSTART", &tz_map)?;
+        let dtstart =
+            match extract_datetime_from_properties(event.properties(), "DTSTART", &tz_map) {
+                Ok(dt) => dt,
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping VEVENT (uid={uid}) at {event_url}: DTSTART parse failed: {e}"
+                    );
+                    continue;
+                }
+            };
         let dtend = extract_datetime_from_properties(event.properties(), "DTEND", &tz_map).ok();
 
         let dtstart_tzid = event
@@ -111,7 +120,16 @@ fn parse_details_icalendar(ics: &str, event_url: &str) -> Result<Vec<EventDetail
             .unwrap_or("(no title)")
             .to_string();
 
-        let dtstart = extract_datetime_from_properties(event.properties(), "DTSTART", &tz_map)?;
+        let dtstart =
+            match extract_datetime_from_properties(event.properties(), "DTSTART", &tz_map) {
+                Ok(dt) => dt,
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping VEVENT (uid={uid}) at {event_url}: DTSTART parse failed: {e}"
+                    );
+                    continue;
+                }
+            };
         let dtend = extract_datetime_from_properties(event.properties(), "DTEND", &tz_map).ok();
 
         let dtstart_tzid = event
@@ -190,12 +208,21 @@ fn parse_events_fallback(ics: &str, event_url: &str) -> Result<Vec<EventSummary>
             .cloned()
             .unwrap_or_else(|| "(no title)".to_string());
 
-        let dtstart_raw = props
-            .get("DTSTART")
-            .ok_or_else(|| CalDavError::IcsParseError("fallback: missing DTSTART".into()))?;
+        let Some(dtstart_raw) = props.get("DTSTART") else {
+            tracing::warn!("skipping fallback VEVENT (uid={uid}) at {event_url}: missing DTSTART");
+            continue;
+        };
 
         let tzid = extract_tzid_param(block, "DTSTART");
-        let dtstart = parse_datetime(dtstart_raw, tzid.as_deref(), &tz_map)?;
+        let dtstart = match parse_datetime(dtstart_raw, tzid.as_deref(), &tz_map) {
+            Ok(dt) => dt,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping fallback VEVENT (uid={uid}) at {event_url}: DTSTART parse failed: {e}"
+                );
+                continue;
+            }
+        };
         let dtstart_tz = resolve_dtstart_tz(tzid.as_deref(), &tz_map);
 
         let dtend = props.get("DTEND").and_then(|v| {
@@ -239,12 +266,21 @@ fn parse_details_fallback(ics: &str, event_url: &str) -> Result<Vec<EventDetail>
             .cloned()
             .unwrap_or_else(|| "(no title)".to_string());
 
-        let dtstart_raw = props
-            .get("DTSTART")
-            .ok_or_else(|| CalDavError::IcsParseError("fallback: missing DTSTART".into()))?;
+        let Some(dtstart_raw) = props.get("DTSTART") else {
+            tracing::warn!("skipping fallback details VEVENT (uid={uid}) at {event_url}: missing DTSTART");
+            continue;
+        };
 
         let tzid = extract_tzid_param(block, "DTSTART");
-        let dtstart = parse_datetime(dtstart_raw, tzid.as_deref(), &tz_map)?;
+        let dtstart = match parse_datetime(dtstart_raw, tzid.as_deref(), &tz_map) {
+            Ok(dt) => dt,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping fallback details VEVENT (uid={uid}) at {event_url}: DTSTART parse failed: {e}"
+                );
+                continue;
+            }
+        };
         let display_tz = resolve_dtstart_tz(tzid.as_deref(), &tz_map);
         let dtend = props.get("DTEND").and_then(|v| {
             let tzid = extract_tzid_param(block, "DTEND");
@@ -405,6 +441,57 @@ END:VCALENDAR\r\n";
             !local.contains("Europe/Berlin") && !local.contains("Berlin"),
             "expected NOT to render in Berlin, got {local:?}"
         );
+    }
+
+    #[test]
+    fn icalendar_path_skips_unparseable_vevent_and_keeps_master() {
+        // Master VEVENT is well-formed and recurring. The override VEVENT has
+        // a DTSTART our parser can't make sense of (unknown TZID with a value
+        // shape we don't recognize). The whole resource must NOT be dropped —
+        // just the unparseable override.
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+SUMMARY:Master series\r\n\
+DTSTART;TZID=America/New_York:20260105T090000\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+RECURRENCE-ID;TZID=America/New_York:20260420T090000\r\n\
+DTSTART:notadate\r\n\
+SUMMARY:Override\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let events = parse_events(ics, "https://example/cal/abc.ics").unwrap();
+        let masters: Vec<_> = events.iter().filter(|e| e.is_recurring).collect();
+        assert_eq!(masters.len(), 1, "master must survive override parse failure");
+        assert_eq!(masters[0].summary, "Master series");
+    }
+
+    #[test]
+    fn fallback_path_skips_unparseable_vevent_and_keeps_master() {
+        // Force the regex fallback by stripping the VCALENDAR wrapper. Same
+        // shape as above: master + bad override; master must survive.
+        let ics = "BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+SUMMARY:Master series\r\n\
+DTSTART:20260105T140000Z\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+RECURRENCE-ID:20260420T140000Z\r\n\
+DTSTART:notadate\r\n\
+SUMMARY:Override\r\n\
+END:VEVENT\r\n";
+
+        let events = parse_events(ics, "https://example/cal/abc.ics").unwrap();
+        let masters: Vec<_> = events.iter().filter(|e| e.is_recurring).collect();
+        assert_eq!(masters.len(), 1, "master must survive override parse failure");
+        assert_eq!(masters[0].summary, "Master series");
     }
 
     #[test]

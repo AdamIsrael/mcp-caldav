@@ -64,6 +64,16 @@ pub struct GetEventDetailsArgs {
     pub calendar_url: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpRawCalendarDataArgs {
+    /// CalDAV URL of the calendar
+    pub calendar_url: String,
+    /// Start date (YYYY-MM-DD)
+    pub start_date: String,
+    /// End date (YYYY-MM-DD)
+    pub end_date: String,
+}
+
 // --- Server implementation ---
 
 impl CalDavServer {
@@ -167,6 +177,12 @@ impl CalDavServer {
 
         let body = xml::calendar_query_body(&to_caldav_timestamp(start), &to_caldav_timestamp(end));
         let resources = client.report(&args.calendar_url, &body).await?;
+        tracing::debug!(
+            "list_events: range={}..{} resources={}",
+            args.start_date,
+            args.end_date,
+            resources.len()
+        );
 
         let range_start = start.and_hms_opt(0, 0, 0).unwrap().and_utc();
         let range_end = end.and_hms_opt(23, 59, 59).unwrap().and_utc();
@@ -176,6 +192,7 @@ impl CalDavServer {
 
         for resource in &resources {
             let Some(ics) = &resource.calendar_data else {
+                tracing::debug!("resource {} has no calendar_data, skipping", resource.href);
                 continue;
             };
 
@@ -186,6 +203,15 @@ impl CalDavServer {
                     continue;
                 }
             };
+            let recurring_count = events.iter().filter(|e| e.is_recurring).count();
+            tracing::debug!(
+                "resource {} parsed: {} events ({} recurring)",
+                resource.href,
+                events.len(),
+                recurring_count
+            );
+
+            let extra_lines = extract_recurrence_modifiers(ics);
 
             for event in &events {
                 if event.is_recurring {
@@ -202,6 +228,7 @@ impl CalDavServer {
                             &rrule_str,
                             event.dtstart,
                             event.dtstart_tz,
+                            &extra_lines,
                             duration,
                             range_start,
                             range_end,
@@ -212,6 +239,12 @@ impl CalDavServer {
                             display_tz,
                         ) {
                             Ok(insts) => {
+                                tracing::debug!(
+                                    "expanded uid={} rrule={:?} -> {} instances in window",
+                                    event.uid,
+                                    rrule_str,
+                                    insts.len()
+                                );
                                 for inst in &insts {
                                     instances_output.push(inst.to_string());
                                 }
@@ -222,6 +255,10 @@ impl CalDavServer {
                             }
                         }
                     } else {
+                        tracing::debug!(
+                            "uid={} marked recurring but no RRULE found in ICS; treating as one-off",
+                            event.uid
+                        );
                         all_events.push(event.clone());
                     }
                 } else {
@@ -229,6 +266,11 @@ impl CalDavServer {
                 }
             }
         }
+        tracing::debug!(
+            "list_events: total {} master/one-off events, {} expanded instances",
+            all_events.len(),
+            instances_output.len()
+        );
 
         all_events.sort_by_key(|e| e.dtstart);
 
@@ -346,16 +388,121 @@ impl CalDavServer {
             Ok(output.join("\n---\n"))
         }
     }
+
+    #[tool(description = "DIAGNOSTIC: fetch and return the unparsed ICS bodies in a date range. Use when list_events seems to be missing events to inspect what the server actually returned.")]
+    async fn dump_raw_calendar_data(
+        &self,
+        Parameters(args): Parameters<DumpRawCalendarDataArgs>,
+    ) -> Result<String, CalDavError> {
+        let client = self.find_client_for_url(&args.calendar_url)?;
+        let start = parse_date(&args.start_date)?;
+        let end = parse_date(&args.end_date)?;
+
+        let body = xml::calendar_query_body(&to_caldav_timestamp(start), &to_caldav_timestamp(end));
+        let resources = client.report(&args.calendar_url, &body).await?;
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{} resource(s) returned for {}..{}\n\n",
+            resources.len(),
+            args.start_date,
+            args.end_date
+        ));
+        for (i, r) in resources.iter().enumerate() {
+            out.push_str(&format!("=== Resource {} : {} ===\n", i + 1, r.href));
+            match &r.calendar_data {
+                Some(ics) => {
+                    out.push_str(ics);
+                    if !ics.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                None => out.push_str("(no calendar-data field on this resource)\n"),
+            }
+            out.push('\n');
+        }
+        Ok(out)
+    }
 }
 
+/// Return the RRULE of the master VEVENT, if any.
+///
+/// "Master" = a VEVENT that carries an RRULE and no RECURRENCE-ID. RRULEs that
+/// live inside VTIMEZONE / STANDARD / DAYLIGHT components (used to describe
+/// DST transitions of the timezone itself) MUST be skipped — feeding one of
+/// those into expand_rrule produces empty windows and the event silently
+/// vanishes. Same for RRULEs on RECURRENCE-ID overrides.
 fn extract_rrule_from_ics(ics: &str) -> Option<String> {
-    for line in ics.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.starts_with("RRULE:") {
-            return Some(line.trim_start_matches("RRULE:").to_string());
+    let mut in_vevent = false;
+    let mut block: Vec<String> = Vec::new();
+
+    for raw in ics.lines() {
+        let line = raw.trim_end_matches('\r').to_string();
+        if line == "BEGIN:VEVENT" {
+            in_vevent = true;
+            block.clear();
+        } else if line == "END:VEVENT" {
+            in_vevent = false;
+            let has_rrule = block.iter().any(|l| l.starts_with("RRULE:"));
+            let has_recurrence_id = block.iter().any(|l| l.starts_with("RECURRENCE-ID"));
+            if has_rrule && !has_recurrence_id {
+                for l in &block {
+                    if let Some(rest) = l.strip_prefix("RRULE:") {
+                        return Some(rest.to_string());
+                    }
+                }
+            }
+        } else if in_vevent {
+            block.push(line);
         }
     }
+
     None
+}
+
+/// Collect recurrence-modifier lines that augment the master RRULE:
+///   - EXDATE/RDATE lines from the master VEVENT (the one with RRULE and no
+///     RECURRENCE-ID).
+///   - A synthetic EXDATE for each override VEVENT's RECURRENCE-ID, so that
+///     master expansion does not emit an instance the override is replacing.
+///     Each override is still surfaced separately by the parser as a
+///     non-recurring VEVENT, so the user sees the override's data on the
+///     overridden date instead of the original.
+///
+/// The lines are returned verbatim in the format the rrule crate expects.
+fn extract_recurrence_modifiers(ics: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut in_vevent = false;
+    let mut block: Vec<String> = Vec::new();
+
+    for raw in ics.lines() {
+        let line = raw.trim_end_matches('\r').to_string();
+        if line == "BEGIN:VEVENT" {
+            in_vevent = true;
+            block.clear();
+        } else if line == "END:VEVENT" {
+            in_vevent = false;
+            let has_rrule = block.iter().any(|l| l.starts_with("RRULE:"));
+            let has_recurrence_id = block.iter().any(|l| l.starts_with("RECURRENCE-ID"));
+            if has_rrule && !has_recurrence_id {
+                for l in &block {
+                    if l.starts_with("EXDATE") || l.starts_with("RDATE") {
+                        lines.push(l.clone());
+                    }
+                }
+            } else if has_recurrence_id {
+                for l in &block {
+                    if let Some(rest) = l.strip_prefix("RECURRENCE-ID") {
+                        lines.push(format!("EXDATE{rest}"));
+                    }
+                }
+            }
+        } else if in_vevent {
+            block.push(line);
+        }
+    }
+
+    lines
 }
 
 // --- rmcp ServerHandler ---
@@ -367,5 +514,184 @@ impl rmcp::ServerHandler for CalDavServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions("Browse, search, and read calendar events via CalDAV. Use list_calendars to discover available calendars, then list_events or search_events to find events.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_modifiers_from_master_only_returns_exdate_and_rdate() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+DTSTART:20260101T140000Z\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+EXDATE:20260202T140000Z\r\n\
+RDATE:20260503T140000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let lines = extract_recurrence_modifiers(ics);
+        assert_eq!(
+            lines,
+            vec![
+                "EXDATE:20260202T140000Z".to_string(),
+                "RDATE:20260503T140000Z".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_modifiers_converts_recurrence_id_to_synthetic_exdate() {
+        // Master + override: the override's RECURRENCE-ID becomes a synthetic
+        // EXDATE so master expansion skips that date. The override itself is
+        // still emitted by the parser as a separate non-recurring VEVENT.
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+DTSTART:20260101T140000Z\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+RECURRENCE-ID:20260504T140000Z\r\n\
+DTSTART:20260504T160000Z\r\n\
+SUMMARY:Moved to 16:00\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let lines = extract_recurrence_modifiers(ics);
+        assert_eq!(lines, vec!["EXDATE:20260504T140000Z".to_string()]);
+    }
+
+    #[test]
+    fn extract_modifiers_handles_tzid_parameters() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+DTSTART;TZID=America/New_York:20260101T090000\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+EXDATE;TZID=America/New_York:20260202T090000\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+RECURRENCE-ID;TZID=America/New_York:20260504T090000\r\n\
+DTSTART;TZID=America/New_York:20260504T100000\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let lines = extract_recurrence_modifiers(ics);
+        assert_eq!(
+            lines,
+            vec![
+                "EXDATE;TZID=America/New_York:20260202T090000".to_string(),
+                "EXDATE;TZID=America/New_York:20260504T090000".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_rrule_skips_vtimezone_standard_and_daylight() {
+        // Real-shape ICS from Fastmail: VTIMEZONE STANDARD/DAYLIGHT each carry
+        // their own RRULE describing DST transitions. Those must NOT be
+        // returned — the consumer wants the VEVENT's RRULE only. This was the
+        // root cause of two recurring events silently disappearing from
+        // list_events for a user on Fastmail (Toronto).
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:America/Toronto\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:19700101T000000\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\n\
+TZOFFSETFROM:-0400\r\n\
+TZOFFSETTO:-0500\r\n\
+END:STANDARD\r\n\
+BEGIN:DAYLIGHT\r\n\
+DTSTART:19700101T000000\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\n\
+TZOFFSETFROM:-0500\r\n\
+TZOFFSETTO:-0400\r\n\
+END:DAYLIGHT\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+DTSTART;TZID=America/Toronto:20240602T220000\r\n\
+RRULE:FREQ=WEEKLY\r\n\
+SUMMARY:Ozempic\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        assert_eq!(
+            extract_rrule_from_ics(ics).as_deref(),
+            Some("FREQ=WEEKLY"),
+            "must return the VEVENT's RRULE, not VTIMEZONE STANDARD's"
+        );
+    }
+
+    #[test]
+    fn extract_rrule_returns_master_when_override_is_present() {
+        // Master + RECURRENCE-ID override: master's RRULE wins, override is
+        // skipped (its RRULE — if any — would be a per-instance modification).
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+DTSTART:20260101T140000Z\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+RECURRENCE-ID:20260504T140000Z\r\n\
+DTSTART:20260504T160000Z\r\n\
+RRULE:FREQ=DAILY\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        assert_eq!(
+            extract_rrule_from_ics(ics).as_deref(),
+            Some("FREQ=WEEKLY;BYDAY=MO"),
+            "override RRULE must not shadow the master's"
+        );
+    }
+
+    #[test]
+    fn extract_rrule_returns_none_for_non_recurring() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:America/Toronto\r\n\
+BEGIN:STANDARD\r\n\
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+DTSTART:20260503T140000Z\r\n\
+SUMMARY:One-off\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        assert!(extract_rrule_from_ics(ics).is_none());
+    }
+
+    #[test]
+    fn extract_modifiers_returns_empty_when_no_modifiers_present() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:abc\r\n\
+DTSTART:20260101T140000Z\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let lines = extract_recurrence_modifiers(ics);
+        assert!(lines.is_empty());
     }
 }
